@@ -228,7 +228,11 @@ class AlertsDialog(QDialog):
 class TrayWatcher:
     def __init__(self, app):
         self.app = app
-        self.tray = QSystemTrayIcon()
+        # Build the tray WITH its icon in the constructor. Setting the icon
+        # after construction can fail to register with the Windows 11 shell on
+        # some builds (the entry appears iconless / not at all); passing it to
+        # the constructor is reliable. refresh() updates it by state thereafter.
+        self.tray = QSystemTrayIcon(make_icon(ICON_OK))
         self.menu = QMenu()
         self._alerts = []
         self._build_menu()
@@ -449,8 +453,9 @@ def main():
     QLocalServer.removeServer(name)
     server.listen(name)
 
-    TrayWatcher(app)                        # noqa: F841 (kept alive by Qt)
-    return app.exec()
+    watcher = TrayWatcher(app)              # MUST hold a reference: if this is
+    app._logmon_watcher = watcher           # GC'd, self.tray dies and the icon
+    return app.exec()                       # vanishes while the loop keeps running
 
 
 if __name__ == "__main__":
