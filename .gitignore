@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# logmon runtime artifacts (never commit real event data or archives)
+*.evtx
+*.manifest
+*.zip
+logmon.cfg
+logmon.cfg.bak
+logmon_state.json
+logmon.log
+alerts.jsonl
+URGENT.TXT
+EVENT_LOG_ARCHIVE/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
