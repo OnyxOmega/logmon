@@ -1224,20 +1224,30 @@ class MainWindow(QMainWindow):
                     "border=1 cellpadding=4 cellspacing=0>"
                     "<tr><th>Channel</th><th>Destroyed BEFORE logmon</th>"
                     "<th>Destroyed since baseline</th><th>Last cleared by "
-                    "logmon (UTC)</th><th>External clears</th></tr>"]
+                    "logmon (UTC)</th><th>External clears</th>"
+                    "<th>Resets after reboot</th></tr>"]
             for ch, d in sorted(cs.items()):
                 ext = len(d.get("external_clears", []))
+                rst = len(d.get("watermark_resets", []))
                 rows.append(
                     "<tr><td>%s</td><td align=right>%s</td>"
                     "<td align=right>%s</td><td>%s</td>"
-                    "<td align=right style='color:%s'><b>%d</b></td></tr>"
+                    "<td align=right style='color:%s'><b>%d</b></td>"
+                    "<td align=right style='color:%s'>%d</td></tr>"
                     % (ch,
                        "{:,}".format(d.get(
                            "baseline_destroyed_before_logmon", 0)),
                        "{:,}".format(d.get("overwritten_since_baseline", 0)),
                        d.get("last_cleared_by_logmon_utc") or "-",
-                       "#a62828" if ext else "#3d7a52", ext))
-            rows.append("</table>")
+                       "#a62828" if ext else "#3d7a52", ext,
+                       "#b8860b" if rst else "#3d7a52", rst))
+            rows.append(
+                "</table><p><small><b>External clears</b> = watermark fell "
+                "while logmon was running with no reboot to explain it "
+                "(CRITICAL). <b>Resets after reboot</b> = watermark fell across "
+                "a shutdown, consistent with the boot rather than a live clear "
+                "(WARNING, recorded for review -- an offline clear during "
+                "shutdown would look the same).</small></p>")
             parts.append("".join(rows))
 
         unconf = st.get("discovered_unconfigured") or []
