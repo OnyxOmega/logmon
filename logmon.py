@@ -1988,9 +1988,28 @@ def _time_trigger_boundary(bundle_name, bundle_cfg, bundle_state, now):
     if anchor is None:
         return None
     boundary = _next_rotation_boundary(anchor, tf)
-    if boundary is None:
+    if boundary is None or now < boundary:
         return None
-    return boundary if now >= boundary else None
+
+    # CATCH-UP: if the anchor is stale by more than one period (service was
+    # stopped, machine shut down, or the pre-2026-07-20 bug that never advanced
+    # the anchor on an empty rotation), walk forward to the LATEST boundary that
+    # has already elapsed instead of returning the first one.
+    #
+    # This matters beyond speed. The returned boundary becomes the archive's
+    # end_dt, but the capture happens NOW and contains everything accumulated up
+    # to now. Returning a boundary from 71 hours ago would stamp an archive with
+    # a span that ends long before the data it actually holds. Snapping to the
+    # most recent elapsed boundary keeps the span honest and collapses the dead
+    # periods (which have no content of their own -- nothing was rotating) into
+    # a single archive, instead of emitting one mislabeled archive per poll.
+    latest = boundary
+    for _ in range(100000):          # guard: bounded, and requires progress
+        nxt = _next_rotation_boundary(latest, tf)
+        if nxt is None or nxt <= latest or nxt > now:
+            break
+        latest = nxt
+    return latest
 
 
 def effective_size_limit(channel, configured_limit, os_max=None):
