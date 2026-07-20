@@ -149,3 +149,18 @@ charitable, research, and government use. Commercial use requires a separate
 license — see [COMMERCIAL.md](COMMERCIAL.md).
 
 Copyright YASDC / Kevin Perryman.
+
+### Third-party dependencies
+
+logmon ships as Python source and bundles no third-party libraries; the
+dependencies below are installed separately by the operator and remain under
+their own licenses. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for
+details.
+
+| Component     | License                                    |
+|---------------|--------------------------------------------|
+| PySide6 / Qt  | LGPL v3 (GPL v3 / commercial also offered) |
+| pywin32       | PSF/BSD-style permissive                   |
+| cryptography  | Apache 2.0 OR BSD 3-Clause (optional)      |
+
+The service (`logmon.py`) does not import PySide6 — only the GUI and tray do.
