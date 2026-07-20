@@ -301,6 +301,28 @@ def _current_rotation_window_start(now, rotate_period):
     return None
 
 
+def _parse_utc_stamp(s):
+    """Parse a timestamp written by now_utc_str() -- 'YYYY-MM-DD HH:MM:SS.mmmZ'
+    -- OR the plainer anchor form 'YYYY-MM-DD HH:MM:SS'. Returns a naive
+    datetime (UTC) or None.
+
+    Needed because state fields like last_cleared_by_logmon_utc carry the
+    millisecond/Z form, which _parse_anchor (strict '%Y-%m-%d %H:%M:%S') cannot
+    read; passing one to _parse_anchor silently yields None.
+    """
+    if not s:
+        return None
+    txt = str(s).strip()
+    if txt.endswith("Z"):
+        txt = txt[:-1]
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(txt, fmt)
+        except Exception:
+            pass
+    return None
+
+
 def _parse_anchor(s):
     """Parse 'YYYY-MM-DD HH:MM:SS' anchor string from config. Returns a naive
     datetime (representing UTC -- see _utcnow) or None. Anchors are written by
@@ -469,6 +491,28 @@ def now_utc_str():
     """UTC timestamp string with ms precision. LITERAL DUPLICATION."""
     return (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             + "Z")
+
+
+def _system_boot_utc():
+    """Return the UTC datetime this machine last booted, or None if unavailable.
+
+    Uses kernel32!GetTickCount64 (milliseconds since boot) -- an API call, never
+    parsed log text, per the standing rule about wevtutil output. GetTickCount64
+    (not GetTickCount) is required: the 32-bit variant wraps at ~49.7 days.
+
+    Used to tell a watermark reset caused by a REBOOT apart from one caused by
+    someone clearing a log while logmon was running. See observe_channel.
+    """
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetTickCount64.restype = ctypes.c_ulonglong
+        uptime_ms = int(k32.GetTickCount64())
+        if uptime_ms <= 0:
+            return None
+        return _utcnow() - timedelta(milliseconds=uptime_ms)
+    except Exception:
+        return None
 
 
 def _utcnow():
@@ -1531,28 +1575,85 @@ def observe_channel(channel, at_capture=False):
 
     # ---- TAMPER: newest record number went BACKWARD without a logmon clear ----
     if prev_newest and newest and newest < prev_newest:
-        detail = ("EXTERNAL CLEAR DETECTED: newest EventRecordID fell from %d "
-                  "to %d without logmon clearing this channel. The log was "
-                  "cleared by something other than logmon. Clearing an audit "
-                  "log is a recognized anti-forensic action. NOTE: Event 1102 "
-                  "cannot distinguish this from a logmon clear -- the watermark "
-                  "can." % (prev_newest, newest))
+        # Was the service DOWN across a reboot between these two observations?
+        # If the machine booted after we last looked, the record-number reset is
+        # explained by the downtime (Windows recreates/rolls channel files across
+        # an unclean or long shutdown) rather than by someone clearing a log
+        # while logmon was watching.
+        #
+        # This is EVIDENCE-BASED, not intent inference: the discriminator is the
+        # OS-reported boot time, not a guess about who did what. The event is
+        # still recorded and still alerted -- only the severity and kind change.
+        # A `wevtutil cl` during live operation is unaffected: no reboot occurs
+        # between polls, so it still raises CRITICAL EXTERNAL_CLEAR.
+        prev_seen = _parse_utc_stamp(prev.get("last_observed_utc"))
+        boot_utc = _system_boot_utc()
+        rebooted = bool(prev_seen and boot_utc and boot_utc > prev_seen)
+        gap_s = ((_utcnow() - prev_seen).total_seconds()
+                 if prev_seen else None)
+
+        evidence = {"prev_newest_record": prev_newest,
+                    "observed_newest_record": newest,
+                    "prev_last_observed_utc": prev.get("last_observed_utc"),
+                    "last_cleared_by_logmon_utc":
+                        prev.get("last_cleared_by_logmon_utc"),
+                    "system_boot_utc": (boot_utc.strftime("%Y-%m-%d %H:%M:%S")
+                                        if boot_utc else None),
+                    "observation_gap_seconds": (int(gap_s) if gap_s is not None
+                                                else None),
+                    "reboot_between_observations": rebooted}
+
         result["external_clear"] = {"prev_newest": prev_newest,
                                     "observed_newest": newest,
-                                    "detected_utc": now_s}
-        result["alerts"].append(raise_alert(
-            SEVERITY_CRITICAL, "EXTERNAL_CLEAR", channel, detail,
-            {"prev_newest_record": prev_newest,
-             "observed_newest_record": newest,
-             "prev_last_observed_utc": prev.get("last_observed_utc"),
-             "last_cleared_by_logmon_utc":
-                 prev.get("last_cleared_by_logmon_utc")}))
+                                    "detected_utc": now_s,
+                                    "reboot_explained": rebooted}
 
-        def _m(st):
-            cs = st.setdefault("channel_state", {}).setdefault(channel, {})
-            cs.setdefault("external_clears", []).append(
-                result["external_clear"])
-        _update_state(_m)
+        if rebooted:
+            detail = ("WATERMARK RESET AFTER REBOOT: newest EventRecordID fell "
+                      "from %d to %d, but the machine booted at %s -- AFTER "
+                      "logmon last observed this channel (%s). The reset is "
+                      "consistent with the shutdown/boot, not with a clear "
+                      "performed while logmon was running, so it is NOT "
+                      "reported as an external clear. Recorded for review. "
+                      "CAVEAT: an offline clear performed while the machine was "
+                      "shut down would look identical from the watermark alone."
+                      % (prev_newest, newest,
+                         boot_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                         prev.get("last_observed_utc")))
+            result["alerts"].append(raise_alert(
+                SEVERITY_WARNING, "WATERMARK_RESET_AFTER_REBOOT", channel,
+                detail, evidence))
+
+            def _m(st):
+                cs = st.setdefault("channel_state", {}).setdefault(channel, {})
+                cs.setdefault("watermark_resets", []).append(
+                    result["external_clear"])
+            _update_state(_m)
+        else:
+            if boot_utc is None:
+                basis = ("Boot time could not be determined, so a reboot "
+                         "could not be ruled out; logmon fails safe and "
+                         "reports this as a clear.")
+            else:
+                basis = ("The machine booted at %s, BEFORE logmon last "
+                         "observed this channel (%s), so no reboot explains "
+                         "the reset." % (boot_utc.strftime("%Y-%m-%d %H:%M:%S"),
+                                         prev.get("last_observed_utc")))
+            detail = ("EXTERNAL CLEAR DETECTED: newest EventRecordID fell from "
+                      "%d to %d without logmon clearing this channel. %s The "
+                      "log was cleared by something other than logmon. "
+                      "Clearing an audit log is a recognized anti-forensic "
+                      "action. NOTE: Event 1102 cannot distinguish this from a "
+                      "logmon clear -- the watermark can."
+                      % (prev_newest, newest, basis))
+            result["alerts"].append(raise_alert(
+                SEVERITY_CRITICAL, "EXTERNAL_CLEAR", channel, detail, evidence))
+
+            def _m(st):
+                cs = st.setdefault("channel_state", {}).setdefault(channel, {})
+                cs.setdefault("external_clears", []).append(
+                    result["external_clear"])
+            _update_state(_m)
 
     # ---- LOSS: oldest advanced -> the OS purged exactly that many records ----
     purged = 0
@@ -2162,10 +2263,18 @@ def archive_one_group(archive_root, cfg, group, rotate_period, end_dt,
         extracted_files.append((manifest_path, arc_mfst))
 
     if not extracted_files:
-        logger.warning("group %s: no channels extracted; no zip written", gid)
+        # "Nothing to archive" is a SUCCESSFUL rotation outcome, not an anomaly:
+        # every channel was empty, skipped, or OS-disabled. Advance the anchor
+        # anyway -- the time period genuinely elapsed. Failing to advance leaves
+        # a stale boundary in the past, so the group re-fires on EVERY poll
+        # forever (observed: rot-1h_ret-1M fired 177 times in 72h against the
+        # same stale boundary). Extraction FAILURES are tracked separately by
+        # _record_clear_failure / clear-suppression, so advancing here does not
+        # hide them.
+        logger.info("group %s: no channels had content to archive; "
+                    "no zip written (boundary advanced)", gid)
         _cleanup_work_dir(work_dir)
-        if historical:
-            _record_bundle_anchor(gid, end_dt)   # don't re-dump every cycle
+        _record_bundle_anchor(gid, end_dt)
         return None
 
     try:
@@ -2203,8 +2312,11 @@ def archive_one_size_channel(archive_root, cfg, group, chan, end_dt,
 
     # Coverage start = the last time logmon cleared THIS channel (its true
     # per-channel span), falling back to the group anchor, then to end_dt.
+    # NOTE: last_cleared_by_logmon_utc carries milliseconds + 'Z', so it needs
+    # _parse_utc_stamp -- _parse_anchor would return None and every size archive
+    # would falsely claim to start at the (never-advancing) group anchor.
     cst = get_channel_state(chan)
-    start_dt = (_parse_anchor(cst.get("last_cleared_by_logmon_utc"))
+    start_dt = (_parse_utc_stamp(cst.get("last_cleared_by_logmon_utc"))
                 or _parse_anchor(prev.get("rotation_anchor"))
                 or end_dt)
 
