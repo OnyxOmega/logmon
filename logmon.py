@@ -612,6 +612,30 @@ def _state_path():
     return os.path.join(_logmon_dir(), STATE_FILE_NAME)
 
 
+def _work_root():
+    """Scratch root for in-progress captures. ALWAYS LOCAL -- deliberately under
+    ProgramData\\logmon, never under archive_root.
+
+    Rationale (design decision 2026-07-21): archive_root must contain ONLY
+    finished, hashed, manifested archives. Two reasons:
+
+      1. archive_root is a published surface. Operators point replication at it
+         (robocopy /MIR, DFS-R, backup agents, SOC read-only mounts). A copy job
+         firing mid-rotation must never catch half-extracted .evtx files or a
+         partially written zip.
+      2. archive_root may be a UNC share. Extracting and zipping across the
+         network multiplies I/O and widens the window in which a dropped link
+         leaves already-cleared events in a scratch directory. Doing the work
+         locally and moving only the finished zip keeps the fragile part on
+         local disk.
+
+    ProgramData\\logmon is used rather than %TEMP% because the service runs as
+    LocalSystem (whose %TEMP% is C:\\Windows\\Temp, shared with everything else
+    on the box) and because this directory already carries logmon's own ACLs.
+    """
+    return os.path.join(_logmon_dir(), "work")
+
+
 def _atomic_write_json(path, doc):
     """temp file + fsync + os.replace. The only sanctioned way to write either
     file; the GUI must use the same pattern for logmon.cfg."""
@@ -1830,6 +1854,51 @@ def _build_provenance(channel, obs, end_dt, size_limit=None,
     return prov
 
 
+def _publish_archive(local_zip, archive_root, base):
+    """Move a FINISHED zip from the local work directory into archive_root.
+
+    This is the only step that touches archive_root, so archive_root only ever
+    gains complete, hashed, manifested archives -- never transient state. If
+    archive_root is a UNC share, this is also the only step that crosses the
+    network.
+
+    Collision handling happens HERE (at the destination, immediately before the
+    move) rather than at name-computation time, so the check is against the
+    directory as it actually is when we write.
+
+    Returns the final path, or None on failure. On failure the finished zip is
+    LEFT IN PLACE locally and its path is logged at ERROR: the source channels
+    have already been cleared, so that file is the only copy and must not be
+    silently discarded.
+    """
+    import shutil
+    try:
+        os.makedirs(archive_root, exist_ok=True)
+    except Exception as exc:
+        logger.error("archive_root %s unavailable (%r). FINISHED ARCHIVE LEFT "
+                     "AT %s -- move it manually; its channels are already "
+                     "cleared.", archive_root, exc, local_zip)
+        return None
+
+    dest = os.path.join(archive_root, base + ".zip")
+    if os.path.exists(dest):
+        i = 2
+        while os.path.exists(os.path.join(archive_root,
+                                          base + "_dup%d.zip" % i)):
+            i += 1
+        dest = os.path.join(archive_root, base + "_dup%d.zip" % i)
+    try:
+        # shutil.move (not os.replace) -- archive_root may be a different
+        # volume or a UNC share, where a rename would fail.
+        shutil.move(local_zip, dest)
+        return dest
+    except Exception as exc:
+        logger.error("could not move finished archive to %s (%r). FINISHED "
+                     "ARCHIVE LEFT AT %s -- move it manually; its channels are "
+                     "already cleared.", dest, exc, local_zip)
+        return None
+
+
 def _cleanup_work_dir(work_dir):
     """Remove per-extraction working directory once files are in the zip."""
     try:
@@ -2246,8 +2315,9 @@ def archive_one_group(archive_root, cfg, group, rotate_period, end_dt,
     """
     gid = _group_id(group["rotation"], group["retention"])
     retention_str = group["retention"]
-    os.makedirs(archive_root, exist_ok=True)
-    work_dir = os.path.join(archive_root, "._logmon_work_%s" % gid)
+    # Scratch is LOCAL (never under archive_root) so archive_root only ever
+    # receives finished archives -- see _work_root().
+    work_dir = os.path.join(_work_root(), gid)
     os.makedirs(work_dir, exist_ok=True)
 
     prev = get_bundle_state(gid)
@@ -2256,13 +2326,9 @@ def archive_one_group(archive_root, cfg, group, rotate_period, end_dt,
 
     base = _group_archive_basename(end_dt, start_dt, group["rotation"],
                                    retention_str, historical)
-    zip_path = os.path.join(archive_root, base + ".zip")
-    if os.path.exists(zip_path):
-        i = 2
-        while os.path.exists(os.path.join(archive_root,
-                                          base + "_dup%d.zip" % i)):
-            i += 1
-        zip_path = os.path.join(archive_root, base + "_dup%d.zip" % i)
+    # Built locally under the work dir; _publish_archive moves it to
+    # archive_root and resolves any name collision at the destination.
+    zip_path = os.path.join(work_dir, base + ".zip")
 
     missing = set(prev.get("missing_channels", []))
     now = _utcnow()
@@ -2298,15 +2364,24 @@ def archive_one_group(archive_root, cfg, group, rotate_period, end_dt,
 
     try:
         build_zip_bundle(zip_path, extracted_files)
-        _cleanup_work_dir(work_dir)
     except Exception as exc:
-        logger.error("zip build failed for group %s: %r", gid, exc)
+        logger.error("zip build failed for group %s: %r. Extracted .evtx left "
+                     "in %s -- their channels are already cleared.",
+                     gid, exc, work_dir)
         return None
+
+    final_path = _publish_archive(zip_path, archive_root, base)
+    if final_path is None:
+        # Zip is complete but could not be placed. _publish_archive logged the
+        # local path; leave the work dir intact so nothing is lost.
+        return None
+    _cleanup_work_dir(work_dir)
 
     _record_bundle_anchor(gid, end_dt)
     logger.info("archive: group=%s reason=%s channels=%d zip=%s",
-                gid, reason, len(group["channels"]), os.path.basename(zip_path))
-    return zip_path
+                gid, reason, len(group["channels"]),
+                os.path.basename(final_path))
+    return final_path
 
 
 def archive_one_size_channel(archive_root, cfg, group, chan, end_dt,
@@ -2321,8 +2396,8 @@ def archive_one_size_channel(archive_root, cfg, group, chan, end_dt,
     """
     gid = _group_id(group["rotation"], group["retention"])
     retention_str = group["retention"]
-    os.makedirs(archive_root, exist_ok=True)
-    work_dir = os.path.join(archive_root, "._logmon_work_%s" % gid)
+    # Scratch is LOCAL (never under archive_root) -- see _work_root().
+    work_dir = os.path.join(_work_root(), gid)
     os.makedirs(work_dir, exist_ok=True)
 
     prev = get_bundle_state(gid)
@@ -2349,29 +2424,29 @@ def archive_one_size_channel(archive_root, cfg, group, chan, end_dt,
 
     base = _size_archive_basename(chan, end_dt, start_dt, group["rotation"],
                                   retention_str)
-    zip_path = os.path.join(archive_root, base + ".zip")
-    if os.path.exists(zip_path):
-        i = 2
-        while os.path.exists(os.path.join(archive_root,
-                                          base + "_dup%d.zip" % i)):
-            i += 1
-        zip_path = os.path.join(archive_root, base + "_dup%d.zip" % i)
+    zip_path = os.path.join(work_dir, base + ".zip")
 
     arc_evtx = "%s/%s" % (safe_chan, os.path.basename(evtx_path))
     arc_mfst = "%s/%s" % (safe_chan, os.path.basename(manifest_path))
     try:
         build_zip_bundle(zip_path, [(evtx_path, arc_evtx),
                                     (manifest_path, arc_mfst)])
-        _cleanup_work_dir(work_dir)
     except Exception as exc:
-        logger.error("size-archive zip build failed for %s: %r", chan, exc)
+        logger.error("size-archive zip build failed for %s: %r. Extracted "
+                     ".evtx left in %s -- the channel is already cleared.",
+                     chan, exc, work_dir)
         return None
+
+    final_path = _publish_archive(zip_path, archive_root, base)
+    if final_path is None:
+        return None
+    _cleanup_work_dir(work_dir)
 
     # NOTE: deliberately does NOT call _record_bundle_anchor -- a size trip must
     # not move the group's time boundary.
     logger.info("archive: channel=%s group=%s reason=size zip=%s",
-                chan, gid, os.path.basename(zip_path))
-    return zip_path
+                chan, gid, os.path.basename(final_path))
+    return final_path
 
 
 def log_unconfigured_discoveries_v2(all_channels, cfg):
