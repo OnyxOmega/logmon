@@ -44,6 +44,53 @@ alters OS log configuration.
 - **Never** produces events into the channels it archives.
 - Not real-time; it operates on scheduled polling cycles.
 - Windows only. No cross-platform runtime.
+- Does not replicate, sync, or ship archives anywhere. See **Storage scope**.
+- Does not read other machines' logs. It archives only the host it runs on.
+
+---
+
+## Storage scope
+
+**logmon writes and prunes exactly one archive root, and that root is expected
+to be local.** Replication, offsite copies, immutable/WORM storage, and
+downstream access (SOC, SIEM, e-discovery) are out of scope *by design* — they
+are jobs for tools that already do them well.
+
+The reason is that a legal-retention store needs one unambiguous answer to
+"give me everything for channel X in 2026", which requires a single writer over
+a single authoritative store. Splitting archives across a primary and a fallback
+location would make that answer depend on which destination happened to be
+reachable that day.
+
+Instead, logmon makes its output safe for anything else to copy:
+
+- **archive_root holds only finished artifacts.** Extraction and zipping happen
+  in a local scratch directory (`%ProgramData%\logmon\work`); only the
+  completed, hashed, manifested zip is moved in. A copy job running mid-rotation
+  cannot catch partial state.
+- **Every archive is self-describing.** The filename carries its own
+  `DELETE-AFTER_<date>` and the manifest carries the full retention block plus
+  four hashes per `.evtx`.
+- **So any copy is independently verifiable and prunable** — a script that can
+  read a filename can enforce retention on a replica, with no logmon instance
+  and no shared state.
+
+Point logmon at a local path and replicate with `robocopy /MIR`, DFS-R, a backup
+agent, or object storage with a lifecycle policy. Use `/MIR` when the remote
+should mirror local retention; copy without mirror-delete when it is a
+longer-term vault, and let the `DELETE-AFTER` dates drive its own pruning.
+
+`archive_root` does accept a UNC path if you want logmon writing to a share
+directly — see the design lock for the caveats (LocalSystem authenticates as the
+computer account, mapped drives do not work for services, give each host its own
+subdirectory, and watch MAX_PATH).
+
+**Fleet coverage:** logmon never reads another machine's channels. To cover many
+systems, run Windows Event Forwarding and install logmon on the WEC collector,
+where it archives the collector's own channels plus `ForwardedEvents`. WEC is
+best-effort, so events that never reach the collector are invisible to logmon;
+where per-endpoint completeness is the obligation, run logmon on the endpoints
+too.
 
 ---
 
